@@ -1,13 +1,13 @@
-
 import {
-    addDoc,
-    collection,
-    deleteDoc,
-    doc,
-    getDocs,
-    query,
-    serverTimestamp,
-    where,
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDocs,
+  query,
+  serverTimestamp,
+  updateDoc,
+  where,
 } from "firebase/firestore";
 
 import { auth, db } from "../config/firebase";
@@ -28,11 +28,7 @@ function getCurrentUserId() {
   return user.uid;
 }
 
-export async function addTrustedContact(
-  input: TrustedContactInput
-) {
-  const userId = getCurrentUserId();
-
+function validateContact(input: TrustedContactInput) {
   const name = input.name.trim();
   const phone = input.phone.trim();
   const relationship = input.relationship.trim();
@@ -45,13 +41,39 @@ export async function addTrustedContact(
     throw new Error("Please enter a valid phone number.");
   }
 
+  return { name, phone, relationship };
+}
+
+async function verifyContactOwnership(contactId: string, userId: string) {
+  if (!contactId.trim()) {
+    throw new Error("Invalid contact ID.");
+  }
+
+  const contactsQuery = query(
+    collection(db, "trustedContacts"),
+    where("userId", "==", userId)
+  );
+
+  const snapshot = await getDocs(contactsQuery);
+
+  const belongsToUser = snapshot.docs.some(
+    (document) => document.id === contactId
+  );
+
+  if (!belongsToUser) {
+    throw new Error("Contact not found or access denied.");
+  }
+}
+
+export async function addTrustedContact(input: TrustedContactInput) {
+  const userId = getCurrentUserId();
+  const contact = validateContact(input);
+
   const contactRef = await addDoc(
     collection(db, "trustedContacts"),
     {
       userId,
-      name,
-      phone,
-      relationship,
+      ...contact,
       createdAt: serverTimestamp(),
     }
   );
@@ -75,27 +97,25 @@ export async function getTrustedContacts() {
   }));
 }
 
-export async function deleteTrustedContact(
-  contactId: string
+export async function updateTrustedContact(
+  contactId: string,
+  input: TrustedContactInput
 ) {
   const userId = getCurrentUserId();
+  const contact = validateContact(input);
 
-  const contactRef = doc(db, "trustedContacts", contactId);
+  await verifyContactOwnership(contactId, userId);
 
-  const contactsQuery = query(
-    collection(db, "trustedContacts"),
-    where("userId", "==", userId)
-  );
+  await updateDoc(doc(db, "trustedContacts", contactId), {
+    ...contact,
+    updatedAt: serverTimestamp(),
+  });
+}
 
-  const snapshot = await getDocs(contactsQuery);
+export async function deleteTrustedContact(contactId: string) {
+  const userId = getCurrentUserId();
 
-  const belongsToUser = snapshot.docs.some(
-    (document) => document.id === contactId
-  );
+  await verifyContactOwnership(contactId, userId);
 
-  if (!belongsToUser) {
-    throw new Error("Contact not found or access denied.");
-  }
-
-  await deleteDoc(contactRef);
+  await deleteDoc(doc(db, "trustedContacts", contactId));
 }

@@ -1,5 +1,7 @@
 
-import { useState } from 'react';
+import * as Location from 'expo-location';
+import { useEffect, useRef, useState } from 'react';
+import { useRouter } from 'expo-router';
 import {
   Alert,
   Platform,
@@ -10,6 +12,10 @@ import {
   Text,
   View,
 } from 'react-native';
+import { createIncident, subscribeToMyIncidents } from '../../services/incidents';
+import { createIncidentTracking, updateUserLocation } from '../../services/incidentTracking';
+import * as SMS from 'expo-sms';
+import { getTrustedContacts } from '../../services/trustedContacts';
 
 const COLORS = {
   navy: '#14243A',
@@ -29,7 +35,6 @@ const categories = [
   { icon: '♡', title: 'Other Help', detail: 'Request assistance', color: '#E9F6F0' },
 ];
 
-// Works in the browser and on native devices.
 function showMessage(title: string, message: string) {
   if (Platform.OS === 'web') {
     window.alert(`${title}\n\n${message}`);
@@ -39,26 +44,225 @@ function showMessage(title: string, message: string) {
 }
 
 export default function HomeScreen() {
+  const router = useRouter();
   const [selected, setSelected] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const userWatchers = useRef(
+    new Map<string, Location.LocationSubscription>()
+  );
 
-  const handleSOS = () => {
-    showMessage(
-      'SOS Demo',
-      'Your demo SOS request has been triggered. No real emergency alert has been sent.'
+  useEffect(() => {
+    let active = true;
+    let unsubscribe = () => {};
+
+    const startWatcher = async (incidentId: string) => {
+      if (userWatchers.current.has(incidentId)) return;
+
+      try {
+        const watcher = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.Balanced,
+            timeInterval: 5000,
+            distanceInterval: 5,
+          },
+          (position) => {
+            void updateUserLocation(incidentId, {
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude,
+            }).catch((error) =>
+              console.error('User live GPS update failed:', error)
+            );
+          }
+        );
+
+        if (!active) {
+          watcher.remove();
+        } else {
+          userWatchers.current.set(incidentId, watcher);
+        }
+      } catch (error) {
+        console.error('Unable to start user GPS watcher:', error);
+      }
+    };
+
+    try {
+      unsubscribe = subscribeToMyIncidents((incidents) => {
+        const activeIds = new Set(
+          incidents
+            .filter((incident) =>
+              ['pending', 'assigned'].includes(String(incident.status))
+            )
+            .map((incident) => incident.id)
+        );
+
+        for (const [id, watcher] of userWatchers.current) {
+          if (!activeIds.has(id)) {
+            watcher.remove();
+            userWatchers.current.delete(id);
+          }
+        }
+
+        activeIds.forEach((id) => void startWatcher(id));
+      }, (error) => {
+        console.error('User incident subscription failed:', error);
+      });
+    } catch (error) {
+      console.error('Unable to subscribe to user incidents:', error);
+    }
+
+    return () => {
+      active = false;
+      unsubscribe();
+      userWatchers.current.forEach((watcher) => watcher.remove());
+      userWatchers.current.clear();
+    };
+  }, []);
+
+
+  const submitIncident = async (category: string) => {
+    if (isSubmitting) return;
+
+    try {
+      setIsSubmitting(true);
+      setSelected(category);
+
+      // Ask the user for location permission.
+      const permission =
+        await Location.requestForegroundPermissionsAsync();
+
+      if (permission.status !== 'granted') {
+        showMessage(
+          'Location permission required',
+          'Please allow location access so SafeLink can share your location with responders.'
+        );
+        return;
+      }
+
+      // Get the user's current GPS coordinates.
+      const position = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+
+      const latitude = position.coords.latitude;
+      const longitude = position.coords.longitude;
+
+      // Create the incident in Firebase Firestore.
+      const incidentId = await createIncident({
+        category,
+        description:
+          category === 'High Risk'
+            ? 'Emergency SOS request submitted by the user.'
+            : `${category} assistance requested by the user.`,
+        latitude,
+        longitude,
+      });
+
+      let trackingCreated = false;
+
+      try {
+        await createIncidentTracking(incidentId, {
+          latitude,
+          longitude,
+        });
+        trackingCreated = true;
+      } catch (trackingError) {
+        console.error('Tracking initialization error:', trackingError);
+      }
+
+      let smsStatus = '';
+
+      try {
+        const contacts = await getTrustedContacts();
+
+        if (contacts.length === 0) {
+          smsStatus = 'No trusted contacts are saved yet.';
+        } else if (Platform.OS === 'web') {
+          smsStatus = 'SMS requires the SafeLink mobile app.';
+        } else if (!(await SMS.isAvailableAsync())) {
+          smsStatus = 'SMS is not available on this device.';
+        } else {
+          const phoneNumbers = contacts
+            .map((contact: any) => String(contact.phone).trim())
+            .filter(Boolean);
+
+          if (phoneNumbers.length === 0) {
+            smsStatus = 'No valid trusted contact phone numbers found.';
+          } else {
+            const smsMessage =
+              `SAFELINK EMERGENCY ALERT\n` +
+              `I need help.\n` +
+              `Emergency type: ${category}\n` +
+              `My location: https://maps.google.com/?q=${latitude},${longitude}\n` +
+              `Incident ID: ${incidentId}`;
+
+            const result = await SMS.sendSMSAsync(phoneNumbers, smsMessage);
+            smsStatus = result.result === 'cancelled'
+              ? 'SMS composer closed without sending.'
+              : 'SMS composer opened. Review the message and tap Send.';
+          }
+        }
+      } catch (smsError) {
+        console.error('SMS integration error:', smsError);
+        smsStatus = 'Could not open SMS. Your SOS is still saved.';
+      }
+
+      showMessage(
+        trackingCreated ? 'Request submitted!' : 'SOS submitted with a tracking warning',
+        trackingCreated
+          ? `Your ${category} request has been saved successfully.\n\nIncident ID: ${incidentId}\n\nYour GPS location is attached and tracking has been initialized.`
+          : `Your SOS was saved successfully.\n\nIncident ID: ${incidentId}\n\nLive tracking could not be initialized. Please check the tracking security rules.`
+      );
+      showMessage('Trusted contact SMS', smsStatus || 'SMS step completed.');
+    } catch (error: any) {
+      console.error('Incident submission error:', error);
+
+      showMessage(
+        'Unable to submit request',
+        error?.message ||
+          'Something went wrong. Please check your internet connection and try again.'
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const confirmRequest = (category: string) => {
+    const message =
+      `Do you want to submit a ${category} assistance request? Your current location will be shared with the SafeLink system.`;
+
+    if (Platform.OS === 'web') {
+      if (window.confirm(message)) {
+        void submitIncident(category);
+      }
+      return;
+    }
+
+    Alert.alert(
+      `Request ${category}?`,
+      message,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Confirm',
+          onPress: () => {
+            void submitIncident(category);
+          },
+        },
+      ]
     );
   };
 
+  const handleSOS = () => {
+    confirmRequest('High Risk');
+  };
+
   const handleCategory = (title: string) => {
-    setSelected(title);
-    showMessage(
-      title,
-      `You selected ${title}. This is a demo request. Backend integration will be added separately.`
-    );
+    confirmRequest(title);
   };
 
   return (
     <View style={styles.screen}>
-      <StatusBar barStyle="dark-content" backgroundColor={COLORS.background} />
+      <StatusBar barStyle="dark-content" />
 
       <ScrollView showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
@@ -66,8 +270,11 @@ export default function HomeScreen() {
             <Text style={styles.brand}>
               Safe<Text style={styles.brandAccent}>Link.</Text>
             </Text>
-            <Text style={styles.tagline}>YOUR SAFETY, CONNECTED.</Text>
+            <Text style={styles.tagline}>
+              YOUR SAFETY, CONNECTED.
+            </Text>
           </View>
+
           <View style={styles.profile}>
             <Text style={styles.profileText}>SL</Text>
           </View>
@@ -75,7 +282,9 @@ export default function HomeScreen() {
 
         <View style={styles.welcome}>
           <Text style={styles.eyebrow}>WELCOME BACK</Text>
-          <Text style={styles.heading}>Your safety{'\n'}comes first.</Text>
+          <Text style={styles.heading}>
+            Your safety{'\n'}comes first.
+          </Text>
           <Text style={styles.description}>
             Support is just a tap away. We're here when you need us.
           </Text>
@@ -84,35 +293,51 @@ export default function HomeScreen() {
         <View style={styles.sosCard}>
           <View style={styles.sosTop}>
             <View>
-              <Text style={styles.sosLabel}>EMERGENCY ASSISTANCE</Text>
-              <Text style={styles.sosTitle}>Need help right now?</Text>
+              <Text style={styles.sosLabel}>
+                EMERGENCY ASSISTANCE
+              </Text>
+              <Text style={styles.sosTitle}>
+                Need help right now?
+              </Text>
             </View>
+
             <Text style={styles.sosIcon}>!</Text>
           </View>
 
           <Pressable
             accessibilityRole="button"
+            disabled={isSubmitting}
             onPress={handleSOS}
             style={({ pressed }) => [
               styles.sosButton,
               pressed && styles.pressed,
+              isSubmitting && styles.disabled,
             ]}
           >
-            <Text style={styles.sosButtonText}>SOS</Text>
-            <Text style={styles.sosButtonSub}>REQUEST EMERGENCY HELP</Text>
+            <Text style={styles.sosButtonText}>
+              {isSubmitting ? 'SENDING...' : 'SOS'}
+            </Text>
+            <Text style={styles.sosButtonSub}>
+              {isSubmitting
+                ? 'PLEASE WAIT'
+                : 'REQUEST EMERGENCY HELP'}
+            </Text>
           </Pressable>
 
           <Text style={styles.sosFoot}>
             Use only when you need urgent assistance.
           </Text>
+
           <Text style={styles.demoNote}>
-            DEMO PREVIEW · No real emergency dispatch
+            DEMO PROTOTYPE · Location-based incident reporting
           </Text>
         </View>
 
         <View style={styles.sectionHeader}>
           <View>
-            <Text style={styles.sectionTitle}>How can we help?</Text>
+            <Text style={styles.sectionTitle}>
+              How can we help?
+            </Text>
             <Text style={styles.sectionSub}>
               Choose the assistance you need
             </Text>
@@ -124,11 +349,13 @@ export default function HomeScreen() {
             <Pressable
               key={item.title}
               accessibilityRole="button"
+              disabled={isSubmitting}
               onPress={() => handleCategory(item.title)}
               style={({ pressed }) => [
                 styles.category,
                 selected === item.title && styles.categorySelected,
                 pressed && styles.pressed,
+                isSubmitting && styles.disabled,
               ]}
             >
               <View
@@ -137,27 +364,50 @@ export default function HomeScreen() {
                   { backgroundColor: item.color },
                 ]}
               >
-                <Text style={styles.categoryIconText}>{item.icon}</Text>
+                <Text style={styles.categoryIconText}>
+                  {item.icon}
+                </Text>
               </View>
 
-              <Text style={styles.categoryTitle}>{item.title}</Text>
-              <Text style={styles.categoryDetail}>{item.detail}</Text>
+              <Text style={styles.categoryTitle}>
+                {item.title}
+              </Text>
+              <Text style={styles.categoryDetail}>
+                {item.detail}
+              </Text>
             </Pressable>
           ))}
         </View>
 
         <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Your safety network</Text>
+          <Text style={styles.sectionTitle}>
+            Your safety network
+          </Text>
         </View>
 
         <Pressable
           accessibilityRole="button"
-          onPress={() =>
-            showMessage(
-              'Trusted Contacts',
-              'Trusted contacts management will be available after integration.'
-            )
-          }
+          onPress={() => router.push('/safety-profile' as any)}
+          style={({ pressed }) => [
+            styles.infoCard,
+            pressed && styles.pressed,
+          ]}
+        >
+          <View style={[styles.infoIcon, { backgroundColor: '#EAF2FB' }]}>
+            <Text style={styles.infoIconText}>✚</Text>
+          </View>
+          <View style={styles.infoContent}>
+            <Text style={styles.infoTitle}>Safety Profile</Text>
+            <Text style={styles.infoDescription}>
+              Save important medical and emergency information.
+            </Text>
+          </View>
+          <Text style={styles.arrow}>›</Text>
+        </Pressable>
+
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => router.push('/trusted-contacts')}
           style={({ pressed }) => [
             styles.infoCard,
             pressed && styles.pressed,
@@ -166,12 +416,16 @@ export default function HomeScreen() {
           <View style={styles.infoIcon}>
             <Text style={styles.infoIconText}>♡</Text>
           </View>
+
           <View style={styles.infoContent}>
-            <Text style={styles.infoTitle}>Trusted contacts</Text>
+            <Text style={styles.infoTitle}>
+              Trusted contacts
+            </Text>
             <Text style={styles.infoDescription}>
               Add people who can be notified when you need help.
             </Text>
           </View>
+
           <Text style={styles.arrow}>›</Text>
         </Pressable>
 
@@ -180,7 +434,7 @@ export default function HomeScreen() {
           onPress={() =>
             showMessage(
               'Location Services',
-              'Location sharing will be available after integration.'
+              'Location permission is requested when you submit an emergency request.'
             )
           }
           style={({ pressed }) => [
@@ -188,15 +442,31 @@ export default function HomeScreen() {
             pressed && styles.pressed,
           ]}
         >
-          <View style={[styles.infoIcon, { backgroundColor: '#E9F3FF' }]}>
-            <Text style={[styles.infoIconText, { color: COLORS.blue }]}>⌖</Text>
-          </View>
-          <View style={styles.infoContent}>
-            <Text style={styles.infoTitle}>Location services</Text>
-            <Text style={styles.infoDescription}>
-              Location sharing will be available after integration.
+          <View
+            style={[
+              styles.infoIcon,
+              { backgroundColor: '#E9F3FF' },
+            ]}
+          >
+            <Text
+              style={[
+                styles.infoIconText,
+                { color: COLORS.blue },
+              ]}
+            >
+              ⌖
             </Text>
           </View>
+
+          <View style={styles.infoContent}>
+            <Text style={styles.infoTitle}>
+              Location services
+            </Text>
+            <Text style={styles.infoDescription}>
+              Your GPS location is attached when you submit an emergency request.
+            </Text>
+          </View>
+
           <Text style={styles.arrow}>›</Text>
         </Pressable>
 
@@ -464,5 +734,8 @@ const styles = StyleSheet.create({
   },
   pressed: {
     opacity: 0.75,
+  },
+  disabled: {
+    opacity: 0.6,
   },
 });
